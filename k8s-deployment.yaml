@@ -69,7 +69,7 @@ spec:
         fsGroup: 1000
       containers:
       - name: snitch
-        image: snitch:latest
+        image: realartisan/snitch:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: SLACK_WEBHOOK_URL
