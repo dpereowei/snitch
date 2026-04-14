@@ -15,7 +15,7 @@ import signal
 import time
 import json
 from typing import Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from threading import Thread, Event
 from enum import Enum
 import os
@@ -101,6 +101,17 @@ class EventDatabase:
             """)
 
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS container_baseline (
+                    id TEXT PRIMARY KEY,
+                    pod_uid TEXT NOT NULL,
+                    container_name TEXT NOT NULL,
+                    baseline_restart_count INTEGER NOT NULL,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(pod_uid, container_name)
+                )
+            """)
+
+            conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_undelivered 
                 ON events(delivered, retry_count)
             """)
@@ -108,6 +119,17 @@ class EventDatabase:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_pod_uid 
                 ON events(pod_uid)
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS container_baseline (
+                    id TEXT PRIMARY KEY,
+                    pod_uid TEXT NOT NULL,
+                    container_name TEXT NOT NULL,
+                    baseline_restart_count INTEGER NOT NULL,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(pod_uid, container_name)
+                )
             """)
 
             conn.commit()
@@ -240,6 +262,106 @@ class EventDatabase:
         finally:
             conn.close()
 
+    def record_container_baseline(self, pod_uid: str, container_name: str, restart_count: int):
+        """Record the baseline restart count for a container during initial sync."""
+        conn = self._get_conn()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO container_baseline
+                (id, pod_uid, container_name, baseline_restart_count)
+                VALUES (?, ?, ?, ?)
+            """, (
+                f"baseline:{pod_uid}:{container_name}",
+                pod_uid,
+                container_name,
+                restart_count
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to record baseline for {pod_uid}/{container_name}: {e}")
+        finally:
+            conn.close()
+
+    def get_container_baseline(self, pod_uid: str, container_name: str) -> Optional[int]:
+        """Get baseline restart count for a container, or None if not set."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute("""
+                SELECT baseline_restart_count FROM container_baseline
+                WHERE pod_uid = ? AND container_name = ?
+            """, (pod_uid, container_name)).fetchone()
+            return row["baseline_restart_count"] if row else None
+        finally:
+            conn.close()
+
+    def record_container_baseline(self, pod_uid: str, container_name: str, restart_count: int):
+        """Record the baseline restart count for a container during initial sync."""
+        conn = self._get_conn()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO container_baseline
+                (id, pod_uid, container_name, baseline_restart_count)
+                VALUES (?, ?, ?, ?)
+            """, (
+                f"baseline:{pod_uid}:{container_name}",
+                pod_uid,
+                container_name,
+                restart_count
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to record baseline for {pod_uid}/{container_name}: {e}")
+        finally:
+            conn.close()
+
+    def backfill_baseline_from_events(self, pod_uid: str, container_name: str) -> bool:
+        """
+        Backfill baseline from highest restart_count in events table.
+        Used for backward compatibility with existing pods that already have events.
+        Returns True if backfilled, False if already exists or no events found.
+        """
+        conn = self._get_conn()
+        try:
+            # Check if baseline already exists
+            existing = conn.execute("""
+                SELECT baseline_restart_count FROM container_baseline
+                WHERE pod_uid = ? AND container_name = ?
+            """, (pod_uid, container_name)).fetchone()
+            
+            if existing:
+                return False  # Already has baseline
+            
+            # Get highest restart count from events table
+            row = conn.execute("""
+                SELECT MAX(restart_count) as max_count FROM events
+                WHERE pod_uid = ? AND container_name = ? AND type = ?
+            """, (pod_uid, container_name, EventType.RESTART.value)).fetchone()
+            
+            max_count = row["max_count"] if row else None
+            
+            if max_count is None:
+                return False  # No events found
+            
+            # Backfill baseline from highest event
+            conn.execute("""
+                INSERT OR IGNORE INTO container_baseline
+                (id, pod_uid, container_name, baseline_restart_count)
+                VALUES (?, ?, ?, ?)
+            """, (
+                f"baseline:{pod_uid}:{container_name}",
+                pod_uid,
+                container_name,
+                max_count
+            ))
+            conn.commit()
+            logger.info(f"Backfilled baseline for {pod_uid}/{container_name}: {max_count}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to backfill baseline: {e}")
+            return False
+        finally:
+            conn.close()
+
 
 # ============================================================================
 # EVENT EMISSION LOGIC
@@ -251,25 +373,53 @@ class EventEmitter:
     def __init__(self, db: EventDatabase):
         self.db = db
 
-    def handle_pod(self, pod: client.V1Pod) -> List[Dict[str, Any]]:
+    def handle_pod(self, pod: client.V1Pod, record_baseline: bool = False) -> List[Dict[str, Any]]:
         """
         Detect restart + eviction events from a pod.
         Returns list of emitted events (even if duplicates).
+        
+        If record_baseline=True, records current state as baseline without emitting events.
+        This is used during initial sync to skip alerting on historical restarts.
         """
         events = []
 
         # ---- Restart Events ----
         if pod.status and pod.status.container_statuses:
             for cs in pod.status.container_statuses:
-                if cs.restart_count > 0:
-                    # Gap handling: emit events for all unprocessed restart counts
-                    last_known = self.db.get_last_restart_count(
-                        pod.metadata.uid, cs.name
-                    )
-
-                    for restart_idx in range(last_known + 1, cs.restart_count + 1):
-                        event = self._build_restart_event(pod, cs, restart_idx)
-                        events.append(event)
+                if record_baseline:
+                    # During initial sync, record baseline without emitting events
+                    if cs.restart_count > 0:
+                        self.db.record_container_baseline(
+                            pod.metadata.uid, cs.name, cs.restart_count
+                        )
+                else:
+                    # After baseline established, emit events only for increases
+                    if cs.restart_count > 0:
+                        # Check if we have a baseline for this container
+                        baseline = self.db.get_container_baseline(pod.metadata.uid, cs.name)
+                        
+                        if baseline is not None:
+                            # We have a baseline - only emit if count exceeds it
+                            for restart_idx in range(baseline + 1, cs.restart_count + 1):
+                                event = self._build_restart_event(pod, cs, restart_idx)
+                                events.append(event)
+                        else:
+                            # No baseline - try to backfill from events table (backward compat)
+                            backfilled = self.db.backfill_baseline_from_events(pod.metadata.uid, cs.name)
+                            if backfilled:
+                                # After backfilling, use the new baseline
+                                baseline = self.db.get_container_baseline(pod.metadata.uid, cs.name)
+                                for restart_idx in range(baseline + 1, cs.restart_count + 1):
+                                    event = self._build_restart_event(pod, cs, restart_idx)
+                                    events.append(event)
+                            else:
+                                # No events table entry either - use gap handling
+                                last_known = self.db.get_last_restart_count(
+                                    pod.metadata.uid, cs.name
+                                )
+                                for restart_idx in range(last_known + 1, cs.restart_count + 1):
+                                    event = self._build_restart_event(pod, cs, restart_idx)
+                                    events.append(event)
 
         # ---- Eviction Events ----
         if pod.status and pod.status.reason == "Evicted":
@@ -390,6 +540,32 @@ class SlackDelivery:
                 "text": f"*Restart #:*\n`{event['restart_count']}`"
             })
 
+        # Parse and format timestamp if available
+        if event.get("created_at"):
+            try:
+                # Handle both string and datetime formats
+                if isinstance(event["created_at"], str):
+                    # Parse ISO format or SQLite format
+                    ts = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00"))
+                else:
+                    ts = event["created_at"]
+                
+                # Ensure timestamp is UTC-aware
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                
+                # Convert to WAT (UTC+1)
+                wat_tz = timezone(timedelta(hours=1))
+                ts_wat = ts.astimezone(wat_tz)
+                formatted_time = ts_wat.strftime("%Y-%m-%d %H:%M:%S WAT")
+            except Exception:
+                formatted_time = str(event["created_at"])
+            
+            fields.append({
+                "type": "mrkdwn",
+                "text": f"*Occurred:*\n`{formatted_time}`"
+            })
+
         sections = [
             {
                 "type": "header",
@@ -495,6 +671,7 @@ class PodWatcher:
         self.running = False
         self.stop_event = Event()
         self.resource_version = None
+        self.initial_sync_done = False
 
     def start(self):
         """Start watcher in background thread."""
@@ -552,8 +729,28 @@ class PodWatcher:
                     f"{pod.metadata.namespace}/{pod.metadata.name}"
                 )
 
+                # During initial sync (first list of all pods), record baselines
+                # without emitting alerts. After first resource_version is set,
+                # we switch to normal operation.
+                record_baseline = not self.initial_sync_done and event_type == "ADDED"
+                
+                if record_baseline:
+                    logger.debug(
+                        f"Initial sync in progress - recording baseline for "
+                        f"{pod.metadata.namespace}/{pod.metadata.name}"
+                    )
+
                 # Detect anomalies
-                anomalies = self.emitter.handle_pod(pod)
+                anomalies = self.emitter.handle_pod(pod, record_baseline=record_baseline)
+
+                # After processing the first ADDED event with a resource_version,
+                # mark initial sync as done
+                if not self.initial_sync_done and event_type == "ADDED" and self.resource_version:
+                    self.initial_sync_done = True
+                    logger.info(
+                        "Initial sync complete - baselines recorded, "
+                        "now alerting on new restarts/evictions only"
+                    )
 
                 for anomaly in anomalies:
                     inserted = self.db.insert_event(anomaly)

@@ -50,7 +50,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: gp2
+  storageClassName: gp2 # Replace with your storage class if different
 
 ---
 apiVersion: apps/v1
@@ -76,7 +76,7 @@ spec:
       containers:
       - name: snitch
         image: realartisan/snitch:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         env:
         - name: SLACK_WEBHOOK_URL
           valueFrom:
