@@ -152,7 +152,7 @@ Formats events as Slack Block Kit and sends via webhook.
 
 **Message Structure:**
 ```
-[Header] [RESTART]
+[Header] 
 [Section] Pod, Node, Container, Reason
 [Section] Message (first 500 chars)
 ```

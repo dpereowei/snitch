@@ -1,15 +1,15 @@
-# create "monitoring" namespace if it doesnt exist
+# create "snitch" namespace if it doesnt exist
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: monitoring
+  name: snitch
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: snitch
-  namespace: monitoring
+  namespace: snitch
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -36,14 +36,14 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: snitch
-  namespace: monitoring
+  namespace: snitch
 
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: snitch-db
-  namespace: monitoring
+  namespace: snitch
 spec:
   accessModes:
     - ReadWriteOnce
@@ -57,9 +57,14 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: snitch
-  namespace: monitoring
+  namespace: snitch
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0           # Don't create new pod until old one terminates
+      maxUnavailable: 1     # Allow the old pod to be terminated
   selector:
     matchLabels:
       app: snitch
@@ -69,6 +74,7 @@ spec:
         app: snitch
     spec:
       serviceAccountName: snitch
+      terminationGracePeriodSeconds: 30  # Give pod 30s to gracefully shut down
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -111,7 +117,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: snitch-secrets
-  namespace: monitoring
+  namespace: snitch
 type: Opaque
 stringData:
   slack-webhook-url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"

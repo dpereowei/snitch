@@ -101,6 +101,13 @@ class EventDatabase:
             """)
 
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS deployment_marker (
+                    id TEXT PRIMARY KEY,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS container_baseline (
                     id TEXT PRIMARY KEY,
                     pod_uid TEXT NOT NULL,
@@ -137,6 +144,55 @@ class EventDatabase:
         except Exception as e:
             logger.error(f"Schema init failed: {e}")
             raise
+        finally:
+            conn.close()
+
+    def record_deployment_start(self):
+        """Record that this deployment instance started now."""
+        conn = self._get_conn()
+        try:
+            # Clear old marker and record new one
+            conn.execute("DELETE FROM deployment_marker")
+            conn.execute("INSERT INTO deployment_marker (id) VALUES (?)", ("current",))
+            conn.commit()
+            logger.info("Deployment marker recorded")
+        except Exception as e:
+            logger.error(f"Failed to record deployment marker: {e}")
+        finally:
+            conn.close()
+
+    def mark_old_events_as_delivered(self):
+        """
+        Mark all undelivered events created before this deployment as delivered.
+        Prevents re-sending historic events on pod restart.
+        """
+        conn = self._get_conn()
+        try:
+            # Get the deployment start time
+            marker = conn.execute(
+                "SELECT started_at FROM deployment_marker WHERE id = ?", ("current",)
+            ).fetchone()
+            
+            if not marker:
+                logger.warning("No deployment marker found, skipping old event cleanup")
+                return
+            
+            started_at = marker["started_at"]
+            
+            # Mark all undelivered events created before deployment as delivered
+            conn.execute("""
+                UPDATE events
+                SET delivered = 1
+                WHERE delivered = 0 AND created_at < ?
+            """, (started_at,))
+            
+            count = conn.total_changes
+            conn.commit()
+            
+            if count > 0:
+                logger.info(f"Marked {count} old events as delivered (before deployment)")
+        except Exception as e:
+            logger.error(f"Failed to mark old events: {e}")
         finally:
             conn.close()
 
@@ -422,16 +478,15 @@ class EventEmitter:
                                     events.append(event)
 
         # ---- Eviction Events ----
-        if pod.status and pod.status.reason == "Evicted":
+        # Only emit eviction events after baseline established (not during initial sync)
+        if not record_baseline and pod.status and pod.status.reason == "Evicted":
             event = self._build_eviction_event(pod)
             events.append(event)
 
         return events
 
     def _build_restart_event(
-        self, pod: client.V1Pod, container_status: client.V1ContainerStatus,
-        restart_count: int
-    ) -> Dict[str, Any]:
+        self, pod: client.V1Pod, container_status: client.V1ContainerStatus, restart_count: int) -> Dict[str, Any]:
         """Build a restart event."""
         event_id = f"restart:{pod.metadata.uid}:{container_status.name}:{restart_count}"
 
@@ -729,9 +784,9 @@ class PodWatcher:
                     f"{pod.metadata.namespace}/{pod.metadata.name}"
                 )
 
-                # During initial sync (first list of all pods), record baselines
-                # without emitting alerts. After first resource_version is set,
-                # we switch to normal operation.
+                # During initial sync (LIST phase), record baselines for all pods
+                # without emitting alerts. The LIST phase only sends ADDED events.
+                # Once we see MODIFIED or DELETED, we've transitioned to watch mode.
                 record_baseline = not self.initial_sync_done and event_type == "ADDED"
                 
                 if record_baseline:
@@ -743,9 +798,9 @@ class PodWatcher:
                 # Detect anomalies
                 anomalies = self.emitter.handle_pod(pod, record_baseline=record_baseline)
 
-                # After processing the first ADDED event with a resource_version,
-                # mark initial sync as done
-                if not self.initial_sync_done and event_type == "ADDED" and self.resource_version:
+                # Transition from LIST phase to watch phase: 
+                # If we see a MODIFIED or DELETED event, we're past the initial sync
+                if not self.initial_sync_done and event_type in ("MODIFIED", "DELETED"):
                     self.initial_sync_done = True
                     logger.info(
                         "Initial sync complete - baselines recorded, "
@@ -791,6 +846,10 @@ class Snitch:
     def start(self):
         """Start all components."""
         logger.info("Starting Snitch...")
+
+        # Record this deployment start time and clean up old events
+        self.db.record_deployment_start()
+        self.db.mark_old_events_as_delivered()
 
         self.watcher.start()
 
