@@ -817,7 +817,15 @@ class PodWatcher:
                         )
 
         except ApiException as e:
-            logger.error(f"API error: {e}")
+            if e.status == 410:
+                # Resource version too old - reset and do full LIST next time
+                logger.warning(
+                    f"Resource version expired (410). Resetting to sync from beginning."
+                )
+                self.resource_version = None
+                self.initial_sync_done = False
+            else:
+                logger.error(f"API error: {e}")
         except Exception as e:
             logger.error(f"Watcher error: {e}")
 
