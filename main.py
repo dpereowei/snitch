@@ -817,6 +817,7 @@ class PodWatcher:
                         )
 
         except ApiException as e:
+            watcher.stop()
             if e.status == 410:
                 # Resource version too old - reset and do full LIST next time
                 logger.warning(
@@ -827,6 +828,7 @@ class PodWatcher:
             else:
                 logger.error(f"API error: {e}")
         except Exception as e:
+            watcher.stop()
             logger.error(f"Watcher error: {e}")
 
 
