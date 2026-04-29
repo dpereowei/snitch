@@ -89,6 +89,10 @@ spec:
             secretKeyRef:
               name: snitch-secrets
               key: slack-webhook-url
+        - name: DB_URL
+          value: "sqlite:////var/lib/snitch/events.db"
+        - name: DB_PATH
+          value: "/var/lib/snitch"
         volumeMounts:
         - name: db
           mountPath: /var/lib/snitch
@@ -104,9 +108,19 @@ spec:
             command:
             - /bin/sh
             - -c
-            - "test -f /var/lib/snitch/snitch_events.db"
-          initialDelaySeconds: 30
+            - "test -f /var/lib/snitch/events.db && echo alive || exit 1"
+          initialDelaySeconds: 45
           periodSeconds: 60
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "test -f /var/lib/snitch/events.db && echo ready || exit 1"
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          failureThreshold: 2
       volumes:
       - name: db
         persistentVolumeClaim:
